@@ -7,16 +7,20 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import rpc.turbo.config.TurboConstants;
+import rpc.turbo.protocol.Response;
 import rpc.turbo.serialization.Serializer;
+import rpc.turbo.transport.client.future.FutureContainer;
 
 public class ResponseDecoder extends LengthFieldBasedFrameDecoder {
 	private static final Log logger = LogFactory.getLog(ResponseDecoder.class);
 
 	private final Serializer serializer;
+	private final FutureContainer futureContainer;
 
-	public ResponseDecoder(int maxFrameLength, Serializer serializer) {
+	public ResponseDecoder(int maxFrameLength, Serializer serializer, FutureContainer futureContainer) {
 		super(maxFrameLength, 0, TurboConstants.HEADER_FIELD_LENGTH, 0, TurboConstants.HEADER_FIELD_LENGTH);
 		this.serializer = serializer;
+		this.futureContainer = futureContainer;
 	}
 
 	@Override
@@ -25,7 +29,8 @@ public class ResponseDecoder extends LengthFieldBasedFrameDecoder {
 
 		if (buffer != null) {
 			try {
-				return serializer.readResponse(buffer);
+				Response response = serializer.readResponse(buffer);
+				futureContainer.notifyResponse(response);
 			} finally {
 				buffer.release();
 			}
@@ -42,6 +47,8 @@ public class ResponseDecoder extends LengthFieldBasedFrameDecoder {
 		}
 
 		ctx.channel().close();
+
+		this.futureContainer.close();
 	}
 
 }

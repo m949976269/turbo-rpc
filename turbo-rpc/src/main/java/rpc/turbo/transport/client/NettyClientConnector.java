@@ -12,15 +12,15 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import rpc.turbo.config.HostPort;
-import rpc.turbo.protocol.Request;
 import rpc.turbo.serialization.Serializer;
-import rpc.turbo.transport.client.future.ResponseFutureContainer;
+import rpc.turbo.transport.client.future.RequestWithFuture;
 import rpc.turbo.transport.client.handler.TurboChannelInitializer;
 
 final class NettyClientConnector implements Closeable {
@@ -30,7 +30,6 @@ final class NettyClientConnector implements Closeable {
 
 	private final Serializer serializer;
 	private final EventLoopGroup eventLoopGroup;
-	private final ResponseFutureContainer futureContainer;
 	private final int connectCount;
 
 	public volatile HostPort clientAddress;
@@ -44,13 +43,13 @@ final class NettyClientConnector implements Closeable {
 	 * @param serverAddress
 	 * @param connectCount
 	 */
-	NettyClientConnector(EventLoopGroup eventLoopGroup, Serializer serializer, ResponseFutureContainer futureContainer,
+	NettyClientConnector(EventLoopGroup eventLoopGroup, //
+			Serializer serializer, //
 			HostPort serverAddress, int connectCount) {
 		this.eventLoopGroup = eventLoopGroup;
 		this.connectCount = connectCount;
 		this.serverAddress = serverAddress;
 		this.serializer = serializer;
-		this.futureContainer = futureContainer;
 	}
 
 	int connectCount() {
@@ -65,11 +64,11 @@ final class NettyClientConnector implements Closeable {
 	 * @param request
 	 *            请求数据
 	 */
-	void send(int channelIndex, Request request) {
-		Objects.requireNonNull(request, "request is null");
+	void send(int channelIndex, RequestWithFuture requestWithFuture) {
+		Objects.requireNonNull(requestWithFuture, "request is null");
 
 		Channel channel = channels[channelIndex];
-		channel.writeAndFlush(request, channel.voidPromise());
+		channel.writeAndFlush(requestWithFuture, channel.voidPromise());
 	}
 
 	void connect() throws InterruptedException {
@@ -77,9 +76,11 @@ final class NettyClientConnector implements Closeable {
 		Bootstrap bootstrap = new Bootstrap();
 		bootstrap.group(eventLoopGroup);
 
-		// bootstrap.option(ChannelOption.TCP_NODELAY, true);
 		bootstrap.option(ChannelOption.SO_REUSEADDR, true);
-		bootstrap.option(ChannelOption.SO_KEEPALIVE, true);
+		bootstrap.option(ChannelOption.SO_RCVBUF, 256 * 1024);
+		bootstrap.option(ChannelOption.SO_SNDBUF, 256 * 1024);
+		bootstrap.option(ChannelOption.WRITE_BUFFER_WATER_MARK, //
+				new WriteBufferWaterMark(1024 * 1024, 2048 * 1024));
 
 		if (eventLoopGroup instanceof EpollEventLoopGroup) {
 			bootstrap.option(EpollChannelOption.SO_REUSEPORT, true);
@@ -88,7 +89,7 @@ final class NettyClientConnector implements Closeable {
 			bootstrap.channel(NioSocketChannel.class);
 		}
 
-		bootstrap.handler(new TurboChannelInitializer(futureContainer, serializer));
+		bootstrap.handler(new TurboChannelInitializer(serializer));
 
 		Channel[] newChannels = new Channel[connectCount];
 		for (int i = 0; i < connectCount; i++) {

@@ -27,10 +27,11 @@ import rpc.turbo.param.MethodParam;
 import rpc.turbo.protocol.Request;
 import rpc.turbo.protocol.Response;
 import rpc.turbo.protocol.ResponseStatus;
-import rpc.turbo.protocol.recycle.RecycleUtils;
+import rpc.turbo.recycle.RecycleUtils;
 import rpc.turbo.remote.RemoteException;
 import rpc.turbo.serialization.Serializer;
-import rpc.turbo.transport.client.future.ResponseFutureContainer;
+import rpc.turbo.transport.client.future.RequestWithFuture;
+import rpc.turbo.util.SystemClock;
 import rpc.turbo.util.concurrent.AtomicMuiltInteger;
 import rpc.turbo.util.concurrent.ConcurrentIntToIntArrayMap;
 import rpc.turbo.util.concurrent.ConcurrentIntegerSequencer;
@@ -42,7 +43,6 @@ final class ConnectorContext implements Weightable, Closeable {
 	public final HostPort serverAddress;
 
 	private final int connectCount;
-	private final ResponseFutureContainer futureContainer = new ResponseFutureContainer();
 	private final NettyClientConnector connector;
 	private final ConcurrentIntegerSequencer sequencer = new ConcurrentIntegerSequencer(0, true);
 	private final Semaphore requestWaitSemaphore;
@@ -63,12 +63,21 @@ final class ConnectorContext implements Weightable, Closeable {
 		this.appConfig = appConfig;
 		this.connectCount = appConfig.getConnectPerServer();
 
-		this.connector = new NettyClientConnector(eventLoopGroup, serializer, futureContainer, serverAddress,
+		this.connector = new NettyClientConnector(//
+				eventLoopGroup, //
+				serializer, //
+				serverAddress, //
 				connectCount);
+
 		this.serverAddress = serverAddress;
 
 		this.errorCounter = new AtomicMuiltInteger(connectCount);
-		this.requestWaitSemaphore = new Semaphore(appConfig.getMaxRequestWait());
+
+		if (appConfig.getMaxRequestWait() < 1) {
+			this.requestWaitSemaphore = null;
+		} else {
+			this.requestWaitSemaphore = new Semaphore(appConfig.getMaxRequestWait());
+		}
 
 		this.globalTimeout = appConfig.getGlobalTimeout();
 
@@ -103,14 +112,16 @@ final class ConnectorContext implements Weightable, Closeable {
 					request.setRequestId(requestId);
 
 					CompletableFuture<Response> future = new CompletableFuture<>();
-					futureContainer.addFuture(requestId, future, TurboService.DEFAULT_TIME_OUT);
 
 					try {
-						requestWaitSemaphore.acquire();
+						if (requestWaitSemaphore != null) {
+							requestWaitSemaphore.acquire();
+						}
 
 						boolean allowSend = doRequestFilter(request, heartbeatMethod, heartbeatServiceMethodName);
 						if (allowSend) {
-							connector.send(index, request);
+							long expireTime = SystemClock.fast().mills() + TurboService.DEFAULT_TIME_OUT;
+							connector.send(index, new RequestWithFuture(request, future, expireTime));
 						} else {
 							future.completeExceptionally(
 									new RemoteException(RpcClientFilter.CLIENT_FILTER_DENY, false));
@@ -177,10 +188,6 @@ final class ConnectorContext implements Weightable, Closeable {
 				continue;
 			}
 
-			if (isZombie()) {
-				throw new RemoteException("this connector is zombie");
-			}
-
 			break;
 		}
 
@@ -199,14 +206,19 @@ final class ConnectorContext implements Weightable, Closeable {
 		}
 
 		CompletableFuture<Response> future = new CompletableFuture<>();
-		futureContainer.addFuture(requestId, future, timeout);
 
 		try {
-			requestWaitSemaphore.acquire();
+			if (requestWaitSemaphore != null) {
+				requestWaitSemaphore.acquire();
+			}
 
 			boolean allowSend = doRequestFilter(request);
 			if (allowSend) {
-				connector.send(channelIndex(request), request);
+				long expireTime = SystemClock.fast().mills() + timeout;
+
+				connector.send(//
+						channelIndex(request), //
+						new RequestWithFuture(request, future, expireTime));
 			} else {
 				future.completeExceptionally(new RemoteException(RpcClientFilter.CLIENT_FILTER_DENY, false));
 			}
@@ -250,7 +262,9 @@ final class ConnectorContext implements Weightable, Closeable {
 		}
 
 		return future.handle((response, throwable) -> {
-			requestWaitSemaphore.release();
+			if (requestWaitSemaphore != null) {
+				requestWaitSemaphore.release();
+			}
 
 			boolean error = false;
 			if (throwable != null) {
@@ -282,17 +296,17 @@ final class ConnectorContext implements Weightable, Closeable {
 
 			doResponseFilter(request, response, method, serviceMethodName, throwable);
 
+			T result = (T) response.getResult();
 			RecycleUtils.release(response);
 
 			int channelIndex = channelIndex(request);
 			if (error) {
 				errorCounter.incrementAndGet(channelIndex);
-				futureContainer.remove(request.getRequestId());
 
 				return null;
 			} else {
 				errorCounter.reset(channelIndex);
-				return (T) response.getResult();
+				return result;
 			}
 
 		});
@@ -327,7 +341,9 @@ final class ConnectorContext implements Weightable, Closeable {
 		CompletableFuture<T> futureWithFailover = new CompletableFuture<>();
 
 		future.whenComplete((response, throwable) -> {
-			requestWaitSemaphore.release();
+			if (requestWaitSemaphore != null) {
+				requestWaitSemaphore.release();
+			}
 
 			boolean error = false;
 			if (throwable != null) {
@@ -358,6 +374,7 @@ final class ConnectorContext implements Weightable, Closeable {
 
 			doResponseFilter(request, response, method, serviceMethodName, throwable);
 
+			T result = (T) response.getResult();
 			RecycleUtils.release(response);
 
 			int channelIndex = channelIndex(request);
@@ -367,7 +384,6 @@ final class ConnectorContext implements Weightable, Closeable {
 				}
 
 				errorCounter.incrementAndGet(channelIndex);
-				futureContainer.remove(request.getRequestId());
 
 				failoverInvoker.invoke(methodParam).whenComplete((r, t) -> {
 					if (t != null) {
@@ -378,7 +394,7 @@ final class ConnectorContext implements Weightable, Closeable {
 				});
 			} else {
 				errorCounter.reset(channelIndex);
-				futureWithFailover.complete((T) response.getResult());
+				futureWithFailover.complete(result);
 			}
 		});
 
@@ -477,10 +493,6 @@ final class ConnectorContext implements Weightable, Closeable {
 		this.weight = weight;
 	}
 
-	void doExpireJob() {
-		futureContainer.doExpireJob();
-	}
-
 	boolean isZombie() {
 
 		int sum = 0;
@@ -528,7 +540,6 @@ final class ConnectorContext implements Weightable, Closeable {
 		}
 
 		isClosed = true;
-		futureContainer.close();
 		connector.close();
 	}
 
